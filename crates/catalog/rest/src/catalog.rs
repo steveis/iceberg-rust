@@ -190,6 +190,11 @@ impl RestCatalogConfig {
         self.url_prefixed(&["namespaces", &ns.to_url_string(), "tables"])
     }
 
+    // ARGON fork: multi-table transaction commit endpoint.
+    fn transactions_commit_endpoint(&self) -> String {
+        self.url_prefixed(&["transactions", "commit"])
+    }
+
     fn rename_table_endpoint(&self) -> String {
         self.url_prefixed(&["tables", "rename"])
     }
@@ -2890,6 +2895,55 @@ mod tests {
         if let Err(err) = catalog {
             assert_eq!(err.kind(), ErrorKind::DataInvalid);
             assert_eq!(err.message(), "Catalog uri is required");
+        }
+    }
+}
+
+/// ARGON fork: atomic multi-table commits over the REST spec's
+/// `POST /v1/{prefix}/transactions/commit`. Build each table's changes with
+/// `Transaction::prepare_commit()` and submit them as one transaction; the
+/// catalog applies all-or-nothing. No client-side retry: cross-table
+/// conflict handling belongs to the caller.
+impl RestCatalog {
+    /// Commit multiple tables' updates atomically.
+    pub async fn commit_transaction(
+        &self,
+        commits: Vec<iceberg::TableCommit>,
+    ) -> Result<()> {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "kebab-case")]
+        struct CommitTransactionRequest {
+            table_changes: Vec<CommitTableRequest>,
+        }
+        let context = self.context().await?;
+        let table_changes: Vec<CommitTableRequest> = commits
+            .into_iter()
+            .map(|mut c| CommitTableRequest {
+                identifier: Some(c.identifier().clone()),
+                requirements: c.take_requirements(),
+                updates: c.take_updates(),
+            })
+            .collect();
+        let request = context
+            .client
+            .request(
+                Method::POST,
+                context.config.transactions_commit_endpoint(),
+            )
+            .json(&CommitTransactionRequest { table_changes })
+            .build()?;
+        let http_response = context.client.query_catalog(request).await?;
+        match http_response.status() {
+            StatusCode::OK | StatusCode::NO_CONTENT => Ok(()),
+            StatusCode::CONFLICT => Err(Error::new(
+                ErrorKind::CatalogCommitConflicts,
+                "one or more table requirements failed in the transaction",
+            )
+            .with_retryable(true)),
+            code => Err(Error::new(
+                ErrorKind::Unexpected,
+                format!("transactions/commit returned {code}"),
+            )),
         }
     }
 }
