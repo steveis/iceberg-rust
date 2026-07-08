@@ -456,7 +456,10 @@ impl<'a> SnapshotProducer<'a> {
         update_snapshot_summaries(
             summary,
             previous_snapshot.map(|s| s.summary()),
-            snapshot_produce_operation.operation() == Operation::Overwrite,
+            matches!(
+                snapshot_produce_operation.operation(),
+                Operation::Overwrite | Operation::Replace
+            ),
         )
     }
 
