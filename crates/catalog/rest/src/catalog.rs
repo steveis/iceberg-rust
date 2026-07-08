@@ -214,6 +214,11 @@ impl RestCatalogConfig {
         self.url_prefixed(&["namespaces", &ns.to_url_string(), "tables"])
     }
 
+    // Multi-table transaction commit endpoint (POST /v1/{prefix}/transactions/commit).
+    fn transactions_commit_endpoint(&self) -> String {
+        self.url_prefixed(&["transactions", "commit"])
+    }
+
     fn rename_table_endpoint(&self) -> String {
         self.url_prefixed(&["tables", "rename"])
     }
@@ -3246,6 +3251,179 @@ mod tests {
         if let Err(err) = catalog {
             assert_eq!(err.kind(), ErrorKind::DataInvalid);
             assert_eq!(err.message(), "Catalog uri is required");
+        }
+    }
+
+    fn build_test_table(name: &str) -> Table {
+        let file = File::open(format!(
+            "{}/testdata/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            "create_table_response.json"
+        ))
+        .unwrap();
+        let resp = serde_json::from_reader::<_, LoadTableResult>(BufReader::new(file)).unwrap();
+        Table::builder()
+            .metadata(resp.metadata)
+            .metadata_location(resp.metadata_location.unwrap())
+            .identifier(TableIdent::from_strs(["ns1", name]).unwrap())
+            .file_io(FileIO::new_with_fs())
+            .runtime(test_runtime())
+            .build()
+            .unwrap()
+    }
+
+    async fn prepared_commit(name: &str) -> TableCommit {
+        let table = build_test_table(name);
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .upgrade_table_version()
+            .set_format_version(FormatVersion::V2)
+            .apply(tx)
+            .unwrap();
+        tx.prepare_commit().await.unwrap()
+    }
+
+    // A general caller commits several tables in one atomic transaction: the
+    // client must POST every table's changes to `transactions/commit` and
+    // succeed on a 204. Covers the multi-table (N > 1) path that a single
+    // `update_table` cannot express.
+    #[tokio::test]
+    async fn test_commit_transaction() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+
+        let commit_txn_mock = server
+            .mock("POST", "/v1/transactions/commit")
+            .with_status(204)
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+            Runtime::current(),
+            None,
+        );
+
+        let commits = vec![
+            prepared_commit("test1").await,
+            prepared_commit("test2").await,
+        ];
+
+        catalog.commit_transaction(commits).await.unwrap();
+
+        config_mock.assert_async().await;
+        commit_txn_mock.assert_async().await;
+    }
+
+    // The hostile path a general caller must handle: the catalog rejects the
+    // whole transaction with 409 because a requirement failed. The error is a
+    // retryable commit conflict (nothing was applied), never silently
+    // swallowed.
+    #[tokio::test]
+    async fn test_commit_transaction_conflict() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+
+        let commit_txn_mock = server
+            .mock("POST", "/v1/transactions/commit")
+            .with_status(409)
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+            Runtime::current(),
+            None,
+        );
+
+        let err = catalog
+            .commit_transaction(vec![prepared_commit("test1").await])
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
+        assert!(err.retryable(), "409 transaction conflict must be retryable");
+
+        config_mock.assert_async().await;
+        commit_txn_mock.assert_async().await;
+    }
+}
+
+/// Atomic multi-table commits over the REST spec's
+/// `POST /v1/{prefix}/transactions/commit`. Build each table's changes with
+/// [`Transaction::prepare_commit`] and submit them together; the catalog
+/// applies all of them or none.
+impl RestCatalog {
+    /// Commit multiple tables' updates as a single atomic transaction.
+    ///
+    /// The requirements and updates for each table are produced by
+    /// [`Transaction::prepare_commit`] and sent to the REST catalog's
+    /// `transactions/commit` endpoint, which applies them all-or-nothing.
+    ///
+    /// # Errors and retry contract
+    ///
+    /// This client performs NO retry. The status family mirrors
+    /// [`Catalog::update_table`]'s single-table commit contract, because a
+    /// multi-table commit has the same delivery ambiguity:
+    ///
+    /// - `409 CONFLICT` — one or more table requirements failed; the whole
+    ///   transaction was rejected and applied nothing. Marked retryable: the
+    ///   caller may refresh every table and rebuild the commit.
+    /// - `500` / `502` / `504` — the request may or may not have been applied;
+    ///   the commit state is UNKNOWN. Returned as a non-retryable error so a
+    ///   caller does not blindly re-apply a transaction that may have already
+    ///   landed (double-apply across a table group).
+    /// - any other non-2xx — surfaced with the catalog's own error body.
+    ///
+    /// Cross-table conflict policy above a single retry attempt belongs to the
+    /// caller.
+    pub async fn commit_transaction(&self, commits: Vec<TableCommit>) -> Result<()> {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "kebab-case")]
+        struct CommitTransactionRequest {
+            table_changes: Vec<CommitTableRequest>,
+        }
+        let context = self.context().await?;
+        let table_changes: Vec<CommitTableRequest> = commits
+            .into_iter()
+            .map(|mut c| CommitTableRequest {
+                identifier: Some(c.identifier().clone()),
+                requirements: c.take_requirements(),
+                updates: c.take_updates(),
+            })
+            .collect();
+        let request = context
+            .client
+            .request(Method::POST, context.config.transactions_commit_endpoint())
+            .json(&CommitTransactionRequest { table_changes })
+            .build()?;
+        let http_response = context.client.query_catalog(request).await?;
+        match http_response.status() {
+            StatusCode::OK | StatusCode::NO_CONTENT => Ok(()),
+            StatusCode::CONFLICT => Err(Error::new(
+                ErrorKind::CatalogCommitConflicts,
+                "CatalogCommitConflicts, one or more requirements failed. The client may retry.",
+            )
+            .with_retryable(true)),
+            StatusCode::INTERNAL_SERVER_ERROR => Err(Error::new(
+                ErrorKind::Unexpected,
+                "An unknown server-side problem occurred; the transaction commit state is unknown.",
+            )),
+            StatusCode::BAD_GATEWAY => Err(Error::new(
+                ErrorKind::Unexpected,
+                "A gateway or proxy received an invalid response from the upstream server; the transaction commit state is unknown.",
+            )),
+            StatusCode::GATEWAY_TIMEOUT => Err(Error::new(
+                ErrorKind::Unexpected,
+                "A server-side gateway timeout occurred; the transaction commit state is unknown.",
+            )),
+            _ => Err(deserialize_unexpected_catalog_error(
+                http_response,
+                context.client.disable_header_redaction(),
+            )
+            .await),
         }
     }
 }

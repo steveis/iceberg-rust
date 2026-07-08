@@ -203,6 +203,31 @@ impl Transaction {
         .1
     }
 
+    /// Run this transaction's actions and return the resulting
+    /// [`TableCommit`] WITHOUT sending it to a catalog — the per-table input
+    /// to a multi-table `commit_transaction` (REST
+    /// /v1/{prefix}/transactions/commit). No refresh/retry here: the caller
+    /// owns conflict handling across the transaction group.
+    pub async fn prepare_commit(self) -> Result<TableCommit> {
+        let mut current_table = self.table.clone();
+        let mut existing_updates: Vec<TableUpdate> = vec![];
+        let mut existing_requirements: Vec<TableRequirement> = vec![];
+        for action in &self.actions {
+            let action_commit = Arc::clone(action).commit(&current_table).await?;
+            current_table = Self::apply(
+                current_table,
+                action_commit,
+                &mut existing_updates,
+                &mut existing_requirements,
+            )?;
+        }
+        Ok(TableCommit::builder()
+            .ident(self.table.identifier().to_owned())
+            .updates(existing_updates)
+            .requirements(existing_requirements)
+            .build())
+    }
+
     fn build_backoff(props: TableProperties) -> Result<ExponentialBackoff> {
         Ok(ExponentialBuilder::new()
             .with_min_delay(Duration::from_millis(props.commit_min_retry_wait_ms))
