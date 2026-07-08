@@ -338,6 +338,9 @@ pub(crate) fn update_snapshot_summaries(
     if summary.operation != Operation::Append
         && summary.operation != Operation::Overwrite
         && summary.operation != Operation::Delete
+        // ARGON fork: replace (compaction rewrites) is summary-legal and
+        // truncates totals like overwrite.
+        && summary.operation != Operation::Replace
     {
         return Err(Error::new(
             ErrorKind::DataInvalid,
@@ -346,7 +349,11 @@ pub(crate) fn update_snapshot_summaries(
     }
 
     let mut summary = match previous_summary {
-        Some(prev_summary) if truncate_full_table && summary.operation == Operation::Overwrite => {
+        Some(prev_summary)
+            if truncate_full_table
+                && (summary.operation == Operation::Overwrite
+                    || summary.operation == Operation::Replace) =>
+        {
             truncate_table_summary(summary, prev_summary).map_err(|err| {
                 Error::new(ErrorKind::Unexpected, "Failed to truncate table summary.")
                     .with_source(err)

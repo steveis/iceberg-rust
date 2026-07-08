@@ -56,6 +56,8 @@ pub use action::*;
 mod append;
 mod expire_snapshots;
 // ARGON fork: row-delta commits (data + delete files in one snapshot).
+// ARGON fork: full-table rewrite (compaction / re-clustering) primitive.
+mod rewrite_files;
 mod row_delta;
 mod snapshot;
 mod sort_order;
@@ -77,6 +79,7 @@ use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
 use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
+pub use crate::transaction::rewrite_files::RewriteFilesAction;
 pub use crate::transaction::row_delta::RowDeltaAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
@@ -159,6 +162,13 @@ impl Transaction {
     pub fn row_delta(&self) -> RowDeltaAction {
         RowDeltaAction::new()
     }
+
+    /// ARGON fork: full-table rewrite (compaction / re-clustering) as a
+    /// `replace` snapshot.
+    pub fn rewrite_files(&self) -> RewriteFilesAction {
+        RewriteFilesAction::new()
+    }
+
 
     /// Creates replace sort order action.
     pub fn replace_sort_order(&self) -> ReplaceSortOrderAction {
