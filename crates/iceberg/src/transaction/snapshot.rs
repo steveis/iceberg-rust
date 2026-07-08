@@ -66,6 +66,30 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
     /// which is stored in the snapshot metadata for tracking and auditing purposes.
     fn operation(&self) -> Operation;
 
+    /// Whether the `total-*` snapshot-summary properties should be reset to
+    /// this commit's file set (a full-table replacement) instead of
+    /// accumulated from the parent snapshot.
+    ///
+    /// Defaults to `true` for `Overwrite`/`Replace` operations. Row-level
+    /// deltas override this to `false`: they use the `overwrite` operation
+    /// per the spec but replace rows, not the table, so totals must
+    /// accumulate.
+    ///
+    /// Java-parity note (read first-hand at apache/iceberg@`e42f0dd2`,
+    /// `core/src/main/java/org/apache/iceberg/SnapshotProducer.java:388-467`):
+    /// iceberg-java's `SnapshotProducer.summary(TableMetadata)` accumulates
+    /// every `total-*` UNCONDITIONALLY via `updateTotal` (calls at 422-463,
+    /// helper at 887-917: `newTotal = prevTotal + added - removed`); it has no
+    /// full-replace-vs-delta truncation branch. So the accumulate path a row
+    /// delta takes is exact `newRowDelta()` parity. The `truncate == true`
+    /// default for full overwrites is a crate-side construct (see
+    /// `update_snapshot_summaries`/`truncate_table_summary` in
+    /// `spec/snapshot_summary.rs`), NOT Java behaviour — a row delta opts out
+    /// of it to reproduce Java's unconditional accumulation.
+    fn truncate_full_table(&self) -> bool {
+        matches!(self.operation(), Operation::Overwrite | Operation::Replace)
+    }
+
     /// Returns manifest entries that should be marked as deleted in the new snapshot.
     #[allow(unused)]
     fn delete_entries(
@@ -113,6 +137,10 @@ pub(crate) struct SnapshotProducer<'a> {
     commit_uuid: Uuid,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    // Delete files (equality/position) committed in
+    // the same snapshot; they receive the snapshot's sequence number, so
+    // they apply to strictly-older data — upsert semantics.
+    added_delete_files: Vec<DataFile>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -125,6 +153,7 @@ impl<'a> SnapshotProducer<'a> {
         commit_uuid: Uuid,
         snapshot_properties: HashMap<String, String>,
         added_data_files: Vec<DataFile>,
+        added_delete_files: Vec<DataFile>,
     ) -> Self {
         Self {
             table,
@@ -132,8 +161,32 @@ impl<'a> SnapshotProducer<'a> {
             commit_uuid,
             snapshot_properties,
             added_data_files,
+            added_delete_files,
             manifest_counter: (0..),
         }
+    }
+
+    /// Validate delete files for a row-delta commit.
+    pub(crate) fn validate_added_delete_files(&self) -> Result<()> {
+        for f in &self.added_delete_files {
+            if f.content_type() == crate::spec::DataContentType::Data {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Delete-file list contains data content; use added data files",
+                ));
+            }
+            if self.table.metadata().default_partition_spec_id() != f.partition_spec_id {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Delete file partition spec id does not match table default partition spec id",
+                ));
+            }
+            Self::validate_partition_value(
+                f.partition(),
+                self.table.metadata().default_partition_type(),
+            )?;
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_added_data_files(&self) -> Result<()> {
@@ -340,6 +393,29 @@ impl<'a> SnapshotProducer<'a> {
         writer.write_manifest_file().await
     }
 
+    // Write manifest file for added delete files (row-delta commits) and
+    // return the ManifestFile for the ManifestList.
+    async fn write_added_delete_manifest(&mut self) -> Result<ManifestFile> {
+        let added_delete_files = std::mem::take(&mut self.added_delete_files);
+        let snapshot_id = self.snapshot_id;
+        let format_version = self.table.metadata().format_version();
+        let manifest_entries = added_delete_files.into_iter().map(|delete_file| {
+            let builder = ManifestEntry::builder()
+                .status(crate::spec::ManifestStatus::Added)
+                .data_file(delete_file);
+            if format_version == FormatVersion::V1 {
+                builder.snapshot_id(snapshot_id).build()
+            } else {
+                builder.build()
+            }
+        });
+        let mut writer = self.new_manifest_writer(ManifestContentType::Deletes)?;
+        for entry in manifest_entries {
+            writer.add_entry(entry)?;
+        }
+        writer.write_manifest_file().await
+    }
+
     /// Creates new manifests for data files added or removed,
     /// and collects all of the manifests to be included in the new snapshot as [ManifestFile] entries.
     async fn produce_manifests<OP: SnapshotProduceOperation, MP: ManifestProcess>(
@@ -352,7 +428,10 @@ impl<'a> SnapshotProducer<'a> {
         // TODO: Allowing snapshot property setup with no added data files is a workaround.
         // We should clean it up after all necessary actions are supported.
         // For details, please refer to https://github.com/apache/iceberg-rust/issues/1548
-        if self.added_data_files.is_empty() && self.snapshot_properties.is_empty() {
+        if self.added_data_files.is_empty()
+            && self.added_delete_files.is_empty()
+            && self.snapshot_properties.is_empty()
+        {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
                 "No added data files or added snapshot properties found when write a manifest file",
@@ -368,8 +447,11 @@ impl<'a> SnapshotProducer<'a> {
             manifest_files.push(added_manifest);
         }
 
-        // # TODO
-        // Support process delete entries.
+        // Delete manifests for row-delta commits.
+        if !self.added_delete_files.is_empty() {
+            let delete_manifest = self.write_added_delete_manifest().await?;
+            manifest_files.push(delete_manifest);
+        }
 
         let manifest_files = manifest_process.process_manifests(self, manifest_files);
         Ok(manifest_files)
@@ -405,14 +487,28 @@ impl<'a> SnapshotProducer<'a> {
                 table_metadata.default_partition_spec().clone(),
             );
         }
+        // Delete files count toward the summary too
+        // (added-delete-files / added-equality-deletes / added-files-size).
+        // The collector already handles all three content types.
+        for delete_file in &self.added_delete_files {
+            summary_collector.add_file(
+                delete_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
+        }
 
         let previous_snapshot = table_metadata.current_snapshot();
 
         // User-supplied snapshot properties are applied first, then the computed
-        // metrics overwrite any colliding keys. This matches iceberg-java
-        // (`SnapshotProducer.summary`), where computed `added-*`/`total-*` values
-        // are written after user properties so a user cannot shadow them with a
-        // bad (or merely wrong) value that would corrupt the snapshot summary.
+        // metrics overwrite any colliding keys. This mirrors iceberg-java
+        // `SnapshotProducer.summary(TableMetadata)` (read first-hand at
+        // apache/iceberg@`e42f0dd2`, SnapshotProducer.java:388-467): the
+        // implementation summary that carries user-set properties is copied
+        // first (`builder.putAll(summary)`, line 420) and the computed
+        // `total-*` values are written last, by `updateTotal` (lines 422-463),
+        // so a user cannot shadow them with a bad (or merely wrong) value that
+        // would corrupt the snapshot summary.
         let mut additional_properties = self.snapshot_properties.clone();
         additional_properties.extend(summary_collector.build());
 
@@ -424,7 +520,7 @@ impl<'a> SnapshotProducer<'a> {
         update_snapshot_summaries(
             summary,
             previous_snapshot.map(|s| s.summary()),
-            snapshot_produce_operation.operation() == Operation::Overwrite,
+            snapshot_produce_operation.truncate_full_table(),
         )
     }
 

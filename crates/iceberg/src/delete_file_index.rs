@@ -416,6 +416,55 @@ mod tests {
         assert!(actual_paths_to_apply_for_different_spec.is_empty());
     }
 
+    /// Strictly-older boundary for equality deletes on the READ path — the
+    /// invariant `RowDeltaAction` (`transaction/row_delta.rs`) depends on.
+    ///
+    /// A row delta commits its data files AND its equality-delete files in the
+    /// same snapshot, so both receive the SAME sequence number. Per the Iceberg
+    /// table spec (v2/v3, "Sequence Numbers" / row-level deletes) an equality
+    /// delete applies to a data file only when the delete's data sequence
+    /// number is STRICTLY GREATER than the data file's — enforced above in
+    /// `get_deletes_for_data_file` (`delete.sequence_number() > Some(seq_num)`).
+    ///
+    /// This is the checklist §3 boundary-equal MUST-NOT-apply test for the
+    /// strictly-older rule, exercised through the read path's delete-selection
+    /// function: an equality delete at sequence N does NOT delete data committed
+    /// at the same sequence N (so the rows an upsert appends in the same
+    /// row-delta survive), while it DOES delete strictly-older data at N-1.
+    #[test]
+    fn test_row_delta_equality_delete_strictly_older_boundary() {
+        // One equality delete committed at the row delta's snapshot sequence N.
+        const N: i64 = 5;
+        let eq_delete = build_added_manifest_entry(N, &build_unpartitioned_eq_delete());
+        let eq_delete_path = eq_delete.file_path().to_string();
+
+        let delete_file_index = PopulatedDeleteFileIndex::new(vec![DeleteFileContext {
+            manifest_entry: eq_delete.into(),
+            partition_spec_id: 0,
+        }]);
+
+        let data_file = build_unpartitioned_data_file();
+
+        // Boundary-equal: data committed in the SAME row-delta snapshot (seq N).
+        // The delete MUST NOT apply — same-commit rows are not deleted.
+        let at_boundary = delete_file_index.get_deletes_for_data_file(&data_file, Some(N));
+        assert!(
+            at_boundary.is_empty(),
+            "equality delete at seq {N} must NOT apply to same-sequence (same-commit) data, got {} file(s)",
+            at_boundary.len()
+        );
+
+        // Strictly-older data (seq N-1): the same delete MUST apply.
+        let older = delete_file_index.get_deletes_for_data_file(&data_file, Some(N - 1));
+        let older_paths: Vec<String> = older.into_iter().map(|file| file.file_path).collect();
+        assert_eq!(
+            older_paths,
+            vec![eq_delete_path],
+            "equality delete at seq {N} must apply to strictly-older data at seq {}",
+            N - 1
+        );
+    }
+
     fn build_unpartitioned_eq_delete() -> DataFile {
         build_partitioned_eq_delete(&Struct::empty(), 0)
     }
