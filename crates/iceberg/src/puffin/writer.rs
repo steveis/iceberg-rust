@@ -93,18 +93,26 @@ impl PuffinWriter {
     }
 
     /// ARGON fork: finalize and return what a `StatisticsFile` registration
-    /// needs — (total file size, footer size, blob metadata).
-    pub async fn close_with_metadata(mut self) -> Result<(u64, u64, Vec<BlobMetadata>)> {
+    /// needs — (total file size, footer size, spec blob metadata).
+    pub async fn close_with_metadata(
+        mut self,
+    ) -> Result<(u64, u64, Vec<crate::spec::BlobMetadata>)> {
         self.write_header_once().await?;
         let before_footer = self.num_bytes_written;
         self.write_footer().await?;
         let footer_size = self.num_bytes_written - before_footer;
         self.writer.close().await?;
-        Ok((
-            self.num_bytes_written,
-            footer_size,
-            std::mem::take(&mut self.written_blobs_metadata),
-        ))
+        let blobs = std::mem::take(&mut self.written_blobs_metadata)
+            .into_iter()
+            .map(|b| crate::spec::BlobMetadata {
+                r#type: b.r#type,
+                snapshot_id: b.snapshot_id,
+                sequence_number: b.sequence_number,
+                fields: b.fields,
+                properties: b.properties,
+            })
+            .collect();
+        Ok((self.num_bytes_written, footer_size, blobs))
     }
 
     async fn write(&mut self, bytes: Bytes) -> Result<()> {
