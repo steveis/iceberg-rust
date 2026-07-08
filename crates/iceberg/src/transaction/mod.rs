@@ -55,6 +55,7 @@ mod action;
 pub use action::*;
 mod append;
 // ARGON fork: row-delta commits (data + delete files in one snapshot).
+mod remove_snapshots;
 mod row_delta;
 mod snapshot;
 mod sort_order;
@@ -73,6 +74,7 @@ use crate::spec::TableProperties;
 use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
+pub use crate::transaction::remove_snapshots::RemoveSnapshotsAction;
 pub use crate::transaction::row_delta::RowDeltaAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
@@ -148,6 +150,11 @@ impl Transaction {
     /// overwrite snapshot — CDC upsert commits).
     pub fn row_delta(&self) -> RowDeltaAction {
         RowDeltaAction::new()
+    }
+
+    /// ARGON fork: snapshot expiry (RemoveSnapshots updates).
+    pub fn remove_snapshots(&self) -> RemoveSnapshotsAction {
+        RemoveSnapshotsAction::new()
     }
 
     /// Creates replace sort order action.
