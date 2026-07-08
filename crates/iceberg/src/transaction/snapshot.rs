@@ -114,6 +114,10 @@ pub(crate) struct SnapshotProducer<'a> {
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    // ARGON fork (row-delta): delete files (equality/position) committed in
+    // the same snapshot; they receive the snapshot's sequence number, so
+    // they apply to strictly-older data — upsert semantics.
+    added_delete_files: Vec<DataFile>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -127,6 +131,7 @@ impl<'a> SnapshotProducer<'a> {
         key_metadata: Option<Vec<u8>>,
         snapshot_properties: HashMap<String, String>,
         added_data_files: Vec<DataFile>,
+        added_delete_files: Vec<DataFile>,
     ) -> Self {
         Self {
             table,
@@ -135,8 +140,32 @@ impl<'a> SnapshotProducer<'a> {
             key_metadata,
             snapshot_properties,
             added_data_files,
+            added_delete_files,
             manifest_counter: (0..),
         }
+    }
+
+    /// ARGON fork: validate delete files for a row-delta commit.
+    pub(crate) fn validate_added_delete_files(&self) -> Result<()> {
+        for f in &self.added_delete_files {
+            if f.content_type() == crate::spec::DataContentType::Data {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Delete-file list contains data content; use added data files",
+                ));
+            }
+            if self.table.metadata().default_partition_spec_id() != f.partition_spec_id {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Delete file partition spec id does not match table default partition spec id",
+                ));
+            }
+            Self::validate_partition_value(
+                f.partition(),
+                self.table.metadata().default_partition_type(),
+            )?;
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_added_data_files(&self) -> Result<()> {
@@ -319,6 +348,28 @@ impl<'a> SnapshotProducer<'a> {
         writer.write_manifest_file().await
     }
 
+    // ARGON fork: manifest for added delete files (row-delta commits).
+    async fn write_added_delete_manifest(&mut self) -> Result<ManifestFile> {
+        let added_delete_files = std::mem::take(&mut self.added_delete_files);
+        let snapshot_id = self.snapshot_id;
+        let format_version = self.table.metadata().format_version();
+        let manifest_entries = added_delete_files.into_iter().map(|delete_file| {
+            let builder = ManifestEntry::builder()
+                .status(crate::spec::ManifestStatus::Added)
+                .data_file(delete_file);
+            if format_version == FormatVersion::V1 {
+                builder.snapshot_id(snapshot_id).build()
+            } else {
+                builder.build()
+            }
+        });
+        let mut writer = self.new_manifest_writer(ManifestContentType::Deletes)?;
+        for entry in manifest_entries {
+            writer.add_entry(entry)?;
+        }
+        writer.write_manifest_file().await
+    }
+
     async fn manifest_file<OP: SnapshotProduceOperation, MP: ManifestProcess>(
         &mut self,
         snapshot_produce_operation: &OP,
@@ -329,7 +380,10 @@ impl<'a> SnapshotProducer<'a> {
         // TODO: Allowing snapshot property setup with no added data files is a workaround.
         // We should clean it up after all necessary actions are supported.
         // For details, please refer to https://github.com/apache/iceberg-rust/issues/1548
-        if self.added_data_files.is_empty() && self.snapshot_properties.is_empty() {
+        if self.added_data_files.is_empty()
+            && self.added_delete_files.is_empty()
+            && self.snapshot_properties.is_empty()
+        {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
                 "No added data files or added snapshot properties found when write a manifest file",
@@ -345,8 +399,11 @@ impl<'a> SnapshotProducer<'a> {
             manifest_files.push(added_manifest);
         }
 
-        // # TODO
-        // Support process delete entries.
+        // ARGON fork: delete manifests for row-delta commits.
+        if !self.added_delete_files.is_empty() {
+            let delete_manifest = self.write_added_delete_manifest().await?;
+            manifest_files.push(delete_manifest);
+        }
 
         let manifest_files = manifest_process.process_manifests(self, manifest_files);
         Ok(manifest_files)
