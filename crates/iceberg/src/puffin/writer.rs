@@ -89,10 +89,22 @@ impl PuffinWriter {
 
     /// Finalizes the Puffin file
     pub async fn close(mut self) -> Result<()> {
+        self.close_with_metadata().await.map(|_| ())
+    }
+
+    /// ARGON fork: finalize and return what a `StatisticsFile` registration
+    /// needs — (total file size, footer size, blob metadata).
+    pub async fn close_with_metadata(mut self) -> Result<(u64, u64, Vec<BlobMetadata>)> {
         self.write_header_once().await?;
+        let before_footer = self.num_bytes_written;
         self.write_footer().await?;
+        let footer_size = self.num_bytes_written - before_footer;
         self.writer.close().await?;
-        Ok(())
+        Ok((
+            self.num_bytes_written,
+            footer_size,
+            std::mem::take(&mut self.written_blobs_metadata),
+        ))
     }
 
     async fn write(&mut self, bytes: Bytes) -> Result<()> {
