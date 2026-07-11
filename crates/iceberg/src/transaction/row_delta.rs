@@ -126,6 +126,13 @@ impl SnapshotProduceOperation for RowDeltaOperation {
         Operation::Overwrite
     }
 
+    /// A row delta overwrites rows, not the table: `total-*` summary
+    /// properties accumulate from the parent snapshot (Java `newRowDelta()`
+    /// parity — truncation is for full-table replacement only).
+    fn truncate_full_table(&self) -> bool {
+        false
+    }
+
     async fn delete_entries(
         &self,
         _snapshot_produce: &SnapshotProducer<'_>,
@@ -154,5 +161,19 @@ impl SnapshotProduceOperation for RowDeltaOperation {
             .filter(|entry| entry.has_added_files() || entry.has_existing_files())
             .cloned()
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Row deltas report `overwrite` per the spec but replace rows, not the
+    /// table: summary totals must accumulate, so the truncation hook is off
+    /// (while remaining on by default for real overwrites).
+    #[test]
+    fn row_delta_does_not_truncate_summary_totals() {
+        assert_eq!(RowDeltaOperation.operation(), Operation::Overwrite);
+        assert!(!RowDeltaOperation.truncate_full_table());
     }
 }

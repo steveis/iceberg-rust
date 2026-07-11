@@ -353,7 +353,8 @@ pub(crate) fn update_snapshot_summaries(
         Some(prev_summary)
             if truncate_full_table
                 && (summary.operation == Operation::Overwrite
-                    || summary.operation == Operation::Replace) => {
+                    || summary.operation == Operation::Replace) =>
+        {
             truncate_table_summary(summary, prev_summary)
                 .map_err(|err| {
                     Error::new(ErrorKind::Unexpected, "Failed to truncate table summary.")
@@ -532,6 +533,71 @@ mod tests {
         DataFileFormat, Datum, Literal, NestedField, PartitionSpec, PrimitiveType, Schema, Struct,
         Transform, Type, UnboundPartitionField,
     };
+
+    /// Row-delta commits use the `overwrite` operation but must NOT truncate
+    /// totals: with `truncate_full_table = false` the `total-*` properties
+    /// accumulate from the parent exactly as for appends (Java `newRowDelta()`
+    /// parity).
+    #[test]
+    fn test_update_snapshot_summaries_row_delta_overwrite_accumulates() {
+        let prev_props: HashMap<String, String> = [
+            (TOTAL_DATA_FILES.to_string(), "10".to_string()),
+            (TOTAL_DELETE_FILES.to_string(), "5".to_string()),
+            (TOTAL_RECORDS.to_string(), "100".to_string()),
+            (TOTAL_FILE_SIZE.to_string(), "1000".to_string()),
+            (TOTAL_POSITION_DELETES.to_string(), "3".to_string()),
+            (TOTAL_EQUALITY_DELETES.to_string(), "2".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let previous_summary = Summary {
+            operation: Operation::Append,
+            additional_properties: prev_props,
+        };
+
+        let new_props: HashMap<String, String> = [
+            (ADDED_DATA_FILES.to_string(), "1".to_string()),
+            (ADDED_DELETE_FILES.to_string(), "1".to_string()),
+            (ADDED_RECORDS.to_string(), "40".to_string()),
+            (ADDED_FILE_SIZE.to_string(), "400".to_string()),
+            (ADDED_EQUALITY_DELETES.to_string(), "7".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let summary = Summary {
+            operation: Operation::Overwrite,
+            additional_properties: new_props,
+        };
+
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
+
+        assert_eq!(
+            updated.additional_properties.get(TOTAL_DATA_FILES).unwrap(),
+            "11"
+        );
+        assert_eq!(
+            updated
+                .additional_properties
+                .get(TOTAL_DELETE_FILES)
+                .unwrap(),
+            "6"
+        );
+        assert_eq!(
+            updated.additional_properties.get(TOTAL_RECORDS).unwrap(),
+            "140"
+        );
+        assert_eq!(
+            updated.additional_properties.get(TOTAL_FILE_SIZE).unwrap(),
+            "1400"
+        );
+        assert_eq!(
+            updated
+                .additional_properties
+                .get(TOTAL_EQUALITY_DELETES)
+                .unwrap(),
+            "9"
+        );
+    }
 
     #[test]
     fn test_update_snapshot_summaries_append() {

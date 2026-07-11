@@ -66,6 +66,18 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
     /// which is stored in the snapshot metadata for tracking and auditing purposes.
     fn operation(&self) -> Operation;
 
+    /// Whether the `total-*` snapshot-summary properties should be reset to
+    /// this commit's file set (a full-table replacement) instead of
+    /// accumulated from the parent snapshot.
+    ///
+    /// Defaults to `true` for `Overwrite`/`Replace` operations. Row-level
+    /// deltas override this to `false`: they use the `overwrite` operation
+    /// per the spec but replace rows, not the table, so totals must
+    /// accumulate (Java `newRowDelta()` parity).
+    fn truncate_full_table(&self) -> bool {
+        matches!(self.operation(), Operation::Overwrite | Operation::Replace)
+    }
+
     /// Returns manifest entries that should be marked as deleted in the new snapshot.
     #[allow(unused)]
     fn delete_entries(
@@ -456,10 +468,7 @@ impl<'a> SnapshotProducer<'a> {
         update_snapshot_summaries(
             summary,
             previous_snapshot.map(|s| s.summary()),
-            matches!(
-                snapshot_produce_operation.operation(),
-                Operation::Overwrite | Operation::Replace
-            ),
+            snapshot_produce_operation.truncate_full_table(),
         )
     }
 

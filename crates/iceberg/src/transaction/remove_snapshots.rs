@@ -23,10 +23,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::TableUpdate;
 use crate::error::Result;
 use crate::table::Table;
 use crate::transaction::{ActionCommit, TransactionAction};
-use crate::TableUpdate;
 
 /// Removes the given snapshot ids from table metadata.
 pub struct RemoveSnapshotsAction {
