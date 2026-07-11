@@ -451,11 +451,21 @@ impl<'a> SnapshotProducer<'a> {
                 table_metadata.default_partition_spec().clone(),
             );
         }
+        // ARGON fork: delete files count toward the summary too
+        // (added-delete-files / added-equality-deletes / added-files-size).
+        for delete_file in &self.added_delete_files {
+            summary_collector.add_file(
+                delete_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
+        }
 
-        let previous_snapshot = table_metadata
-            .snapshot_by_id(self.snapshot_id)
-            .and_then(|snapshot| snapshot.parent_snapshot_id())
-            .and_then(|parent_id| table_metadata.snapshot_by_id(parent_id));
+        // The parent of the snapshot being produced is the table's current
+        // snapshot; `snapshot_by_id(self.snapshot_id)` was always None (the
+        // new id isn't in the metadata yet), so totals never accumulated.
+        // Mirrors upstream main (transaction/snapshot.rs).
+        let previous_snapshot = table_metadata.current_snapshot();
 
         let mut additional_properties = summary_collector.build();
         additional_properties.extend(self.snapshot_properties.clone());
