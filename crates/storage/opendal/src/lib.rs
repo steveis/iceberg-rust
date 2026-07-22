@@ -365,7 +365,15 @@ impl OpenDalStorage {
         // Transient errors are common for object stores; we retry temporary
         // failures with exponential backoff. The retry behavior also
         // benefits non-object-store backends.
-        let operator = operator.layer(TimeoutLayer::new()).layer(RetryLayer::new());
+        // ARGON: raise the per-read io timeout from opendal's 10s default —
+        // compaction reads multi-hundred-MB parquet through loaded local
+        // stores and trips 10s under load (2026-07-22, live demo). 60s
+        // keeps the hung-connection protection this layer exists for.
+        // Upstream candidate: make TimeoutLayer configurable via FileIO props.
+        let timeout_layer = TimeoutLayer::new()
+            .with_io_timeout(std::time::Duration::from_secs(60))
+            .with_timeout(std::time::Duration::from_secs(300));
+        let operator = operator.layer(timeout_layer).layer(RetryLayer::new());
         Ok((operator, relative_path))
     }
 
