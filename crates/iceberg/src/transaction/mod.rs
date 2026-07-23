@@ -54,6 +54,10 @@ mod action;
 
 pub use action::*;
 mod append;
+// ARGON fork: G-LIN/G-UPG v3 row-lineage tests through row_delta/upgrade
+// (plans/D18-V3-MUST-MAP.md in the ArgonDB repo).
+#[cfg(test)]
+mod argon_lineage_tests;
 mod expire_snapshots;
 // ARGON fork: row-delta commits (data + delete files in one snapshot).
 // ARGON fork: full-table rewrite (compaction / re-clustering) primitive.
