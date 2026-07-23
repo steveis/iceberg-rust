@@ -1655,6 +1655,89 @@ mod tests {
         Ok(())
     }
 
+    /// ARGON (D18 MUST-map 3.7 verification): float bounds under IEEE
+    /// specials — NaN must never be a bound, and with both zero signs
+    /// present the lower bound must be -0.0 and the upper +0.0
+    /// (spec: totalOrder-consistent bounds; -0.0 precedes +0.0).
+    #[tokio::test]
+    async fn argon_float_bounds_nan_and_signed_zero() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("argon-fb".to_string(), None, DataFileFormat::Parquet);
+
+        let arrow_schema = {
+            let fields = vec![
+                Field::new("f32", arrow_schema::DataType::Float32, false).with_metadata(
+                    HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "0".to_string())]),
+                ),
+                Field::new("f64", arrow_schema::DataType::Float64, false).with_metadata(
+                    HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+                ),
+            ];
+            Arc::new(arrow_schema::Schema::new(fields))
+        };
+        let f32_col = Arc::new(Float32Array::from_iter_values_with_nulls(
+            [-0.0_f32, 0.0, f32::NAN].into_iter(),
+            None,
+        )) as ArrayRef;
+        let f64_col = Arc::new(Float64Array::from_iter_values_with_nulls(
+            [-0.0_f64, 0.0, f64::NAN].into_iter(),
+            None,
+        )) as ArrayRef;
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![f32_col, f64_col]).unwrap();
+
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+        let mut pw = ParquetWriterBuilder::new(
+            WriterProperties::builder().build(),
+            Arc::new(to_write.schema().as_ref().try_into().unwrap()),
+        )
+        .build(output_file)
+        .await?;
+        pw.write(&to_write).await?;
+        let res = pw.close().await?;
+        let data_file = res
+            .into_iter()
+            .next()
+            .unwrap()
+            .content(crate::spec::DataContentType::Data)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()
+            .unwrap();
+
+        use crate::spec::PrimitiveLiteral;
+        let bit_f32 = |d: &Datum| match d.literal() {
+            PrimitiveLiteral::Float(v) => v.to_bits(),
+            other => panic!("expected float bound, got {other:?}"),
+        };
+        let bit_f64 = |d: &Datum| match d.literal() {
+            PrimitiveLiteral::Double(v) => v.to_bits(),
+            other => panic!("expected double bound, got {other:?}"),
+        };
+        let lower = data_file.lower_bounds();
+        let upper = data_file.upper_bounds();
+        // NaN is never a bound (it IS in the data).
+        for d in lower.values().chain(upper.values()) {
+            match d.literal() {
+                PrimitiveLiteral::Float(v) => assert!(!v.is_nan(), "NaN leaked into bounds"),
+                PrimitiveLiteral::Double(v) => assert!(!v.is_nan(), "NaN leaked into bounds"),
+                _ => {}
+            }
+        }
+        // -0.0 must be the lower bound, +0.0 the upper (bit-exact).
+        assert_eq!(bit_f32(&lower[&0]), (-0.0_f32).to_bits(), "f32 lower must be -0.0");
+        assert_eq!(bit_f64(&lower[&1]), (-0.0_f64).to_bits(), "f64 lower must be -0.0");
+        assert_eq!(bit_f32(&upper[&0]), (0.0_f32).to_bits(), "f32 upper must be +0.0");
+        assert_eq!(bit_f64(&upper[&1]), (0.0_f64).to_bits(), "f64 upper must be +0.0");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_nan_val_cnts_primitive_type() -> Result<()> {
         let temp_dir = TempDir::new().unwrap();
