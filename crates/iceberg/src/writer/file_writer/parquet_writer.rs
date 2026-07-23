@@ -1731,10 +1731,26 @@ mod tests {
             }
         }
         // -0.0 must be the lower bound, +0.0 the upper (bit-exact).
-        assert_eq!(bit_f32(&lower[&0]), (-0.0_f32).to_bits(), "f32 lower must be -0.0");
-        assert_eq!(bit_f64(&lower[&1]), (-0.0_f64).to_bits(), "f64 lower must be -0.0");
-        assert_eq!(bit_f32(&upper[&0]), (0.0_f32).to_bits(), "f32 upper must be +0.0");
-        assert_eq!(bit_f64(&upper[&1]), (0.0_f64).to_bits(), "f64 upper must be +0.0");
+        assert_eq!(
+            bit_f32(&lower[&0]),
+            (-0.0_f32).to_bits(),
+            "f32 lower must be -0.0"
+        );
+        assert_eq!(
+            bit_f64(&lower[&1]),
+            (-0.0_f64).to_bits(),
+            "f64 lower must be -0.0"
+        );
+        assert_eq!(
+            bit_f32(&upper[&0]),
+            (0.0_f32).to_bits(),
+            "f32 upper must be +0.0"
+        );
+        assert_eq!(
+            bit_f64(&upper[&1]),
+            (0.0_f64).to_bits(),
+            "f64 upper must be +0.0"
+        );
         Ok(())
     }
 

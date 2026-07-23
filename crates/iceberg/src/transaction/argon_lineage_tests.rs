@@ -131,9 +131,21 @@ async fn row_delta_v3_lineage_data_and_delete_manifests() {
     let table = tx.commit(&catalog).await.unwrap();
 
     let snap1 = table.metadata().current_snapshot().unwrap();
-    assert_eq!(snap1.first_row_id(), Some(0), "1.5: first-row-id = next-row-id at commit");
-    assert_eq!(snap1.added_rows_count(), Some(30), "1.6: added-rows recorded");
-    assert_eq!(table.metadata().next_row_id(), 30, "1.7: next-row-id > all assigned IDs");
+    assert_eq!(
+        snap1.first_row_id(),
+        Some(0),
+        "1.5: first-row-id = next-row-id at commit"
+    );
+    assert_eq!(
+        snap1.added_rows_count(),
+        Some(30),
+        "1.6: added-rows recorded"
+    );
+    assert_eq!(
+        table.metadata().next_row_id(),
+        30,
+        "1.7: next-row-id > all assigned IDs"
+    );
 
     let list1 = table.manifest_list_reader(snap1).load().await.unwrap();
     let (data1, del1): (Vec<_>, Vec<_>) = list1
@@ -141,8 +153,15 @@ async fn row_delta_v3_lineage_data_and_delete_manifests() {
         .iter()
         .partition(|m| m.content == crate::spec::ManifestContentType::Data);
     assert_eq!((data1.len(), del1.len()), (1, 1));
-    assert_eq!(data1[0].first_row_id, Some(0), "1.8: data manifest assigned");
-    assert_eq!(del1[0].first_row_id, None, "1.8: delete manifest always null");
+    assert_eq!(
+        data1[0].first_row_id,
+        Some(0),
+        "1.8: data manifest assigned"
+    );
+    assert_eq!(
+        del1[0].first_row_id, None,
+        "1.8: delete manifest always null"
+    );
 
     // 1.9: the new data-file ENTRY carries null first_row_id (inherited).
     let manifest = data1[0].load_manifest(table.file_io()).await.unwrap();
@@ -273,9 +292,17 @@ async fn upgrade_v2_to_v3_first_commit_assigns_all_data_manifests() {
         .unwrap();
     let table = tx.commit(&catalog).await.unwrap();
     assert_eq!(table.metadata().format_version(), FormatVersion::V3);
-    assert_eq!(table.metadata().next_row_id(), 0, "1.10: next-row-id init 0");
+    assert_eq!(
+        table.metadata().next_row_id(),
+        0,
+        "1.10: next-row-id init 0"
+    );
     let old_snap = table.metadata().snapshot_by_id(v2_snap_id).unwrap();
-    assert_eq!(old_snap.first_row_id(), None, "1.10: old snapshots untouched");
+    assert_eq!(
+        old_snap.first_row_id(),
+        None,
+        "1.10: old snapshots untouched"
+    );
 
     // First post-upgrade commit: manifest C (20 rows) added; A and B must be
     // assigned too, in order, before C.
@@ -372,7 +399,9 @@ async fn v3_commit_retry_restamps_first_row_id_from_refreshed_metadata() {
         let metadata: TableMetadata = serde_json::from_value(doc).unwrap();
         Table::builder()
             .metadata(metadata)
-            .metadata_location(format!("memory://root/argon_retry/metadata/v-{next_row_id}.json"))
+            .metadata_location(format!(
+                "memory://root/argon_retry/metadata/v-{next_row_id}.json"
+            ))
             .identifier(TableIdent::from_strs(["ns1", "argon_retry"]).unwrap())
             .file_io(FileIO::new_with_memory())
             .runtime(crate::test_utils::test_runtime())
@@ -403,9 +432,7 @@ async fn v3_commit_retry_restamps_first_row_id_from_refreshed_metadata() {
     let load_calls = AtomicU32::new(0);
     mock_catalog.expect_load_table().returning_st(move |_| {
         let n = load_calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async move {
-            Ok(v3_table_with_next_row_id(if n == 0 { 100 } else { 150 }))
-        })
+        Box::pin(async move { Ok(v3_table_with_next_row_id(if n == 0 { 100 } else { 150 })) })
     });
 
     let update_calls = AtomicU32::new(0);
