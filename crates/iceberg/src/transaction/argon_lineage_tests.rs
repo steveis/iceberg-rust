@@ -163,13 +163,33 @@ async fn row_delta_v3_lineage_data_and_delete_manifests() {
         "1.8: delete manifest always null"
     );
 
-    // 1.9: the new data-file ENTRY carries null first_row_id (inherited).
+    // 1.9 write half: the new data-file ENTRY is WRITTEN with null
+    // first_row_id — asserted on the raw avro bytes (parse_avro applies
+    // no inheritance).
+    let raw = table
+        .file_io()
+        .new_input(&data1[0].manifest_path)
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    let raw_manifest = crate::spec::Manifest::parse_avro(&raw).unwrap();
+    for entry in raw_manifest.entries() {
+        assert_eq!(
+            entry.data_file().first_row_id(),
+            None,
+            "1.9: added data entries WRITTEN with null first_row_id"
+        );
+    }
+    // D4 read half (spec §First Row ID Inheritance): load_manifest ASSIGNS
+    // the inherited value, so consumers (compaction) see the real row-id
+    // space — manifest first_row_id 0 + no preceding files = Some(0).
     let manifest = data1[0].load_manifest(table.file_io()).await.unwrap();
     for entry in manifest.entries() {
         assert_eq!(
             entry.data_file().first_row_id(),
-            None,
-            "1.9: added data entries written with null first_row_id"
+            Some(0),
+            "D4: load_manifest assigns inherited first_row_id"
         );
     }
 
