@@ -116,6 +116,12 @@ impl AddColumn {
 pub struct UpdateSchemaAction {
     additions: Vec<AddColumn>,
     deletes: Vec<String>,
+    // Columns to widen from `required` to `optional`. Spec-legal and
+    // metadata-only: the field keeps its ID and every existing data file is
+    // reused unchanged (only the `required` flag flips). The Java
+    // `UpdateSchema.makeColumnOptional` equivalent, complementing the existing
+    // `add_column`/`delete_column` evolutions.
+    make_optional: Vec<String>,
 }
 
 impl UpdateSchemaAction {
@@ -124,6 +130,7 @@ impl UpdateSchemaAction {
         Self {
             additions: Vec::new(),
             deletes: Vec::new(),
+            make_optional: Vec::new(),
         }
     }
 
@@ -146,6 +153,23 @@ impl UpdateSchemaAction {
     /// At commit time, the column must exist in the current schema.
     pub fn delete_column(mut self, name: impl ToString) -> Self {
         self.deletes.push(name.to_string());
+        self
+    }
+
+    /// Widen a `required` column to `optional` — the Java
+    /// `UpdateSchema.makeColumnOptional(name)` equivalent. Spec-legal and
+    /// always type-compatible (required -> optional never invalidates existing
+    /// rows), and metadata-only: the field keeps its ID and every existing data
+    /// file is reused unchanged (no rewrite). Only the field's `required` flag
+    /// flips; the emitted schema preserves all other field IDs.
+    ///
+    /// At commit time the column must exist and must NOT be an identifier
+    /// (primary-key) field — an Iceberg identifier field cannot be optional.
+    /// Widening an already-optional column is an idempotent no-op (matching the
+    /// Java `SchemaUpdate` model this action follows, line 94): the rebuilt
+    /// field is identical, and no error is raised.
+    pub fn make_column_optional(mut self, name: impl ToString) -> Self {
+        self.make_optional.push(name.to_string());
         self
     }
 }
@@ -259,16 +283,19 @@ fn resolve_parent_target<'a>(
 
 /// Rebuild a slice of fields, applying deletions and additions at every level,
 /// plus any additions keyed by `parent_id` (`None` represents the table root).
+/// Fields whose IDs appear in `make_optional_ids` are re-emitted with
+/// `required = false` (metadata-only widening).
 fn rebuild_fields(
     fields: &[NestedFieldRef],
     adds: &HashMap<Option<i32>, Vec<NestedFieldRef>>,
     delete_ids: &HashSet<i32>,
+    make_optional_ids: &HashSet<i32>,
     parent_id: Option<i32>,
 ) -> Vec<NestedFieldRef> {
     fields
         .iter()
         .filter(|f| !delete_ids.contains(&f.id))
-        .map(|f| rebuild_field(f, adds, delete_ids))
+        .map(|f| rebuild_field(f, adds, delete_ids, make_optional_ids))
         .chain(adds.get(&parent_id).into_iter().flatten().cloned())
         .collect()
 }
@@ -276,19 +303,45 @@ fn rebuild_fields(
 /// Recursively rebuild a single field. If the field (or any descendant) is a struct
 /// that has pending additions, those additions are appended to the struct's fields.
 /// Fields whose IDs appear in `delete_ids` are filtered out at every struct level.
+/// A field whose ID is in `make_optional_ids` is re-emitted with
+/// `required = false`; already-optional fields are unaffected (idempotent).
 fn rebuild_field(
     field: &NestedFieldRef,
     adds: &HashMap<Option<i32>, Vec<NestedFieldRef>>,
     delete_ids: &HashSet<i32>,
+    make_optional_ids: &HashSet<i32>,
 ) -> NestedFieldRef {
+    // required -> optional widening. `&& !contains` makes an already-optional
+    // field a no-op (stays false), so the operation is idempotent.
+    let required = field.required && !make_optional_ids.contains(&field.id);
     match field.field_type.as_ref() {
-        Type::Primitive(_) | Type::Variant(_) => field.clone(),
+        Type::Primitive(_) | Type::Variant(_) => {
+            if required == field.required {
+                field.clone()
+            } else {
+                Arc::new(NestedField {
+                    id: field.id,
+                    name: field.name.clone(),
+                    required,
+                    field_type: field.field_type.clone(),
+                    doc: field.doc.clone(),
+                    initial_default: field.initial_default.clone(),
+                    write_default: field.write_default.clone(),
+                })
+            }
+        }
         Type::Struct(s) => {
-            let new_fields = rebuild_fields(s.fields(), adds, delete_ids, Some(field.id));
+            let new_fields = rebuild_fields(
+                s.fields(),
+                adds,
+                delete_ids,
+                make_optional_ids,
+                Some(field.id),
+            );
             Arc::new(NestedField {
                 id: field.id,
                 name: field.name.clone(),
-                required: field.required,
+                required,
                 field_type: Box::new(Type::Struct(StructType::new(new_fields))),
                 doc: field.doc.clone(),
                 initial_default: field.initial_default.clone(),
@@ -296,11 +349,11 @@ fn rebuild_field(
             })
         }
         Type::List(l) => {
-            let new_element = rebuild_field(&l.element_field, adds, delete_ids);
+            let new_element = rebuild_field(&l.element_field, adds, delete_ids, make_optional_ids);
             Arc::new(NestedField {
                 id: field.id,
                 name: field.name.clone(),
-                required: field.required,
+                required,
                 field_type: Box::new(Type::List(ListType {
                     element_field: new_element,
                 })),
@@ -310,12 +363,12 @@ fn rebuild_field(
             })
         }
         Type::Map(m) => {
-            let new_key = rebuild_field(&m.key_field, adds, delete_ids);
-            let new_value = rebuild_field(&m.value_field, adds, delete_ids);
+            let new_key = rebuild_field(&m.key_field, adds, delete_ids, make_optional_ids);
+            let new_value = rebuild_field(&m.value_field, adds, delete_ids, make_optional_ids);
             Arc::new(NestedField {
                 id: field.id,
                 name: field.name.clone(),
-                required: field.required,
+                required,
                 field_type: Box::new(Type::Map(MapType {
                     key_field: new_key,
                     value_field: new_value,
@@ -359,6 +412,38 @@ impl TransactionAction for UpdateSchemaAction {
                             Some(_) => Err(Error::new(
                                 ErrorKind::PreconditionFailed,
                                 format!("Cannot delete identifier field: {name}"),
+                            )),
+                            None => Ok(field.id),
+                        }
+                    })
+            })
+            .collect::<Result<HashSet<i32>>>()?;
+
+        // --- 1b. Resolve required->optional widenings ---
+        // Mirrors the delete validation above: the column must exist, and an
+        // identifier (primary-key) field is refused — an Iceberg identifier
+        // field cannot be optional (spec: identifier-field-ids must reference
+        // required fields).
+        let make_optional_ids = self
+            .make_optional
+            .iter()
+            .map(|name: &String| {
+                base_schema
+                    .field_by_name(name)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::PreconditionFailed,
+                            format!("Cannot make missing column optional: {name}"),
+                        )
+                    })
+                    .and_then(|field| {
+                        match base_schema
+                            .identifier_field_ids()
+                            .find(|id| *id == field.id)
+                        {
+                            Some(_) => Err(Error::new(
+                                ErrorKind::PreconditionFailed,
+                                format!("Cannot make identifier field optional: {name}"),
                             )),
                             None => Ok(field.id),
                         }
@@ -449,6 +534,7 @@ impl TransactionAction for UpdateSchemaAction {
             base_schema.as_struct().fields(),
             &additions_by_parent,
             &delete_ids,
+            &make_optional_ids,
             None,
         );
 
@@ -1161,5 +1247,144 @@ mod tests {
             .field_by_name("address.city")
             .expect("address.city should exist");
         assert_eq!(city.id, 6);
+    }
+
+    // -----------------------------------------------------------------------
+    // required -> optional widening (`make_column_optional`): spec-legal,
+    // metadata-only, no data rewrite. Java `UpdateSchema.makeColumnOptional`
+    // equivalent.
+    // -----------------------------------------------------------------------
+
+    /// The core case: a `required`, non-identifier column flips to `optional`,
+    /// keeps its field ID (metadata-only — existing data files stay valid), and
+    /// the action emits the same `AddSchema` + `SetCurrentSchema(-1)` +
+    /// `CurrentSchemaIdMatch` shape as `add_column`/`delete_column`.
+    #[tokio::test]
+    async fn make_column_optional_widens_required_column() {
+        let table = make_v2_table();
+        let tx = Transaction::new(&table);
+
+        // z (id 3) is required and NOT an identifier field.
+        assert!(
+            table
+                .metadata()
+                .current_schema()
+                .field_by_name("z")
+                .unwrap()
+                .required,
+            "precondition: z starts required",
+        );
+
+        let action = tx.update_schema().make_column_optional("z");
+
+        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let updates = action_commit.take_updates();
+        let requirements = action_commit.take_requirements();
+
+        assert_eq!(updates.len(), 2);
+        let new_schema = match &updates[0] {
+            TableUpdate::AddSchema { schema } => schema,
+            other => panic!("expected AddSchema, got {other:?}"),
+        };
+
+        let z = new_schema.field_by_name("z").expect("z should still exist");
+        assert!(!z.required, "z should now be optional");
+        assert_eq!(z.id, 3, "widening is metadata-only: field ID is preserved");
+
+        // Siblings untouched (still required identifier fields).
+        assert!(new_schema.field_by_name("x").unwrap().required);
+        assert!(new_schema.field_by_name("y").unwrap().required);
+
+        assert_eq!(updates[1], TableUpdate::SetCurrentSchema { schema_id: -1 });
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(requirements[0], TableRequirement::CurrentSchemaIdMatch {
+            current_schema_id: table.metadata().current_schema().schema_id()
+        });
+    }
+
+    /// Idempotency (framework convention): widening an ALREADY-optional column
+    /// is a clean no-op — no error, the field stays optional, ID preserved. This
+    /// mirrors the Java `SchemaUpdate` model this action follows (line 94), where
+    /// `makeColumnOptional` on an optional column is a no-op rather than an error.
+        #[tokio::test]
+    async fn make_column_optional_already_optional_is_noop() {
+        let table = make_v2_table_with_nested();
+        let tx = Transaction::new(&table);
+
+        // "person" (id 4) is already optional.
+        assert!(
+            !table
+                .metadata()
+                .current_schema()
+                .field_by_name("person")
+                .unwrap()
+                .required,
+            "precondition: person starts optional",
+        );
+
+        let action = tx.update_schema().make_column_optional("person");
+
+        // No error (idempotent), and the field is unchanged.
+        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let updates = action_commit.take_updates();
+        let new_schema = match &updates[0] {
+            TableUpdate::AddSchema { schema } => schema,
+            other => panic!("expected AddSchema, got {other:?}"),
+        };
+
+        let person = new_schema
+            .field_by_name("person")
+            .expect("person should still exist");
+        assert!(!person.required, "person stays optional");
+        assert_eq!(person.id, 4, "ID preserved");
+        assert!(
+            new_schema.field_by_name("person.name").is_some(),
+            "nested fields preserved by the no-op",
+        );
+    }
+
+    /// An
+    /// identifier (primary-key) field cannot be made optional — Iceberg requires
+    /// identifier-field-ids to reference `required` fields. Refused with
+    /// `PreconditionFailed`, mirroring `delete_column`'s identifier refusal.
+    #[tokio::test]
+    async fn make_column_optional_refuses_identifier_field() {
+        let table = make_v2_table();
+        let tx = Transaction::new(&table);
+
+        // x (id 1) is an identifier field.
+        let action = tx.update_schema().make_column_optional("x");
+
+        let err = match Arc::new(action).commit(&table).await {
+            Err(e) => e,
+            Ok(_) => panic!("should refuse making an identifier field optional"),
+        };
+        assert_eq!(err.kind(), ErrorKind::PreconditionFailed);
+        assert!(
+            err.message().contains("identifier field"),
+            "error should name the identifier-field refusal, got: {}",
+            err.message()
+        );
+    }
+
+    /// A missing column is refused with `PreconditionFailed`, mirroring
+    /// `delete_column`'s missing-column validation.
+    #[tokio::test]
+    async fn make_column_optional_missing_column_fails() {
+        let table = make_v2_table();
+        let tx = Transaction::new(&table);
+
+        let action = tx.update_schema().make_column_optional("nonexistent");
+
+        let err = match Arc::new(action).commit(&table).await {
+            Err(e) => e,
+            Ok(_) => panic!("should reject widening a non-existent column"),
+        };
+        assert_eq!(err.kind(), ErrorKind::PreconditionFailed);
+        assert!(
+            err.message().contains("nonexistent"),
+            "error should name the missing column, got: {}",
+            err.message()
+        );
     }
 }
