@@ -195,6 +195,46 @@ impl ManifestFile {
             entry.inherit_data(self);
         }
 
+        // ARGON (D4): v3 row-lineage first-row-id inheritance, spec §First
+        // Row ID Inheritance: "When reading, the `first_row_id` is assigned
+        // by replacing `null` with the manifest's `first_row_id` plus the sum
+        // of `record_count` for all data files that preceded the file in the
+        // manifest that also had a null `first_row_id`." Entries with a
+        // materialized (non-null) `first_row_id` keep it and do NOT advance
+        // the counter. Manifests without a `first_row_id` (v1/v2, or v3
+        // snapshots that predate the upgrade) leave every entry null, which
+        // reads as null row lineage per §Row Lineage for Upgraded Tables.
+        // Delete files never carry a `first_row_id`.
+        if let Some(manifest_first_row_id) = self.first_row_id {
+            let mut next = i64::try_from(manifest_first_row_id).map_err(|_| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "manifest {} first_row_id {manifest_first_row_id} overflows i64",
+                        self.manifest_path
+                    ),
+                )
+            })?;
+            for entry in &mut entries {
+                if entry.data_file.content == crate::spec::DataContentType::Data
+                    && entry.data_file.first_row_id.is_none()
+                {
+                    entry.data_file.first_row_id = Some(next);
+                    next = next
+                        .checked_add(entry.data_file.record_count as i64)
+                        .ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::DataInvalid,
+                                format!(
+                                    "first_row_id inheritance overflows i64 in manifest {}",
+                                    self.manifest_path
+                                ),
+                            )
+                        })?;
+                }
+            }
+        }
+
         Ok(Manifest::new(metadata, entries))
     }
 }
@@ -383,5 +423,179 @@ mod test {
             .await
             .expect_err("load_manifest must fail when decrypting with the wrong AAD prefix");
         assert_eq!(err.kind(), ErrorKind::Unexpected);
+    }
+
+    // -----------------------------------------------------------------
+    // ARGON (D4): first-row-id inheritance on manifest load — spec §First
+    // Row ID Inheritance. Null entries are assigned manifest.first_row_id
+    // plus the running sum of record_count over PRECEDING null-first_row_id
+    // data files; materialized entries keep their value and do NOT advance
+    // the counter; manifests without first_row_id assign nothing (null
+    // lineage, §Row Lineage for Upgraded Tables); delete manifests are
+    // never assigned.
+    // -----------------------------------------------------------------
+
+    fn d4_data_file(path: &str, record_count: u64, first_row_id: Option<i64>) -> DataFile {
+        DataFile {
+            content: DataContentType::Data,
+            file_path: path.to_string(),
+            file_format: DataFileFormat::Parquet,
+            partition: Struct::empty(),
+            record_count,
+            file_size_in_bytes: 4096,
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            nan_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+            sort_order_id: None,
+            partition_spec_id: 0,
+            first_row_id,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+        }
+    }
+
+    /// Writes a v3 data manifest: added(rc=25, null fri), existing(rc=100,
+    /// materialized fri=500), added(rc=7, null fri). Returns the
+    /// [`ManifestFile`] whose `first_row_id` the caller sets per-arm.
+    async fn d4_write_v3_data_manifest(io: &FileIO, path: &str) -> ManifestFile {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::optional(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .unwrap(),
+        );
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .build()
+            .unwrap();
+        let mut writer = ManifestWriterBuilder::new(
+            io.new_output(path).unwrap(),
+            Some(1),
+            schema,
+            partition_spec,
+        )
+        .build_v3_data();
+        writer
+            .add_entry(ManifestEntry {
+                status: ManifestStatus::Added,
+                snapshot_id: None,
+                sequence_number: None,
+                file_sequence_number: None,
+                data_file: d4_data_file("memory:///d/a.parquet", 25, None),
+            })
+            .unwrap();
+        writer
+            .add_existing_entry(ManifestEntry {
+                status: ManifestStatus::Existing,
+                snapshot_id: Some(1),
+                sequence_number: Some(1),
+                file_sequence_number: Some(1),
+                data_file: d4_data_file("memory:///d/b.parquet", 100, Some(500)),
+            })
+            .unwrap();
+        writer
+            .add_entry(ManifestEntry {
+                status: ManifestStatus::Added,
+                snapshot_id: None,
+                sequence_number: None,
+                file_sequence_number: None,
+                data_file: d4_data_file("memory:///d/c.parquet", 7, None),
+            })
+            .unwrap();
+        writer.write_manifest_file().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn argon_d4_load_manifest_assigns_inherited_first_row_id() {
+        let io = FileIO::new_with_memory();
+        let mut mf =
+            d4_write_v3_data_manifest(&io, "memory:///test/d4_assign_manifest.avro").await;
+        mf.first_row_id = Some(1000);
+
+        let manifest = mf.load_manifest(&io).await.unwrap();
+        let fris: Vec<Option<i64>> = manifest
+            .entries()
+            .iter()
+            .map(|e| e.data_file.first_row_id)
+            .collect();
+        // e0: null -> 1000 (counter -> 1025); e1: materialized 500 kept,
+        // counter NOT advanced; e2: null -> 1025.
+        assert_eq!(fris, vec![Some(1000), Some(500), Some(1025)]);
+    }
+
+    #[tokio::test]
+    async fn argon_d4_load_manifest_without_first_row_id_assigns_nothing() {
+        let io = FileIO::new_with_memory();
+        let mut mf = d4_write_v3_data_manifest(&io, "memory:///test/d4_null_manifest.avro").await;
+        // v1/v2 manifests, and v3 manifests from snapshots that predate the
+        // upgrade, carry no first_row_id: entries must read back untouched
+        // (null lineage), materialized values preserved.
+        mf.first_row_id = None;
+
+        let manifest = mf.load_manifest(&io).await.unwrap();
+        let fris: Vec<Option<i64>> = manifest
+            .entries()
+            .iter()
+            .map(|e| e.data_file.first_row_id)
+            .collect();
+        assert_eq!(fris, vec![None, Some(500), None]);
+    }
+
+    #[tokio::test]
+    async fn argon_d4_load_delete_manifest_never_assigns_first_row_id() {
+        let io = FileIO::new_with_memory();
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::optional(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .unwrap(),
+        );
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .build()
+            .unwrap();
+        let path = "memory:///test/d4_delete_manifest.avro";
+        let mut writer = ManifestWriterBuilder::new(
+            io.new_output(path).unwrap(),
+            Some(1),
+            schema,
+            partition_spec,
+        )
+        .build_v3_deletes();
+        let mut df = d4_data_file("memory:///d/del.parquet", 10, None);
+        df.content = DataContentType::EqualityDeletes;
+        df.equality_ids = Some(vec![1]);
+        writer
+            .add_entry(ManifestEntry {
+                status: ManifestStatus::Added,
+                snapshot_id: None,
+                sequence_number: None,
+                file_sequence_number: None,
+                data_file: df,
+            })
+            .unwrap();
+        let mut mf = writer.write_manifest_file().await.unwrap();
+        // Even a (non-conformant) delete manifest carrying a first_row_id
+        // must not leak assignment into delete-file entries: only
+        // DataContentType::Data participates in inheritance.
+        mf.first_row_id = Some(9999);
+
+        let manifest = mf.load_manifest(&io).await.unwrap();
+        assert_eq!(manifest.entries()[0].data_file.first_row_id, None);
     }
 }
