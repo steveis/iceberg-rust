@@ -817,8 +817,138 @@ impl Display for BoundPredicate {
     }
 }
 
+/// Combines `predicates` with `AND` into a **balanced** binary tree.
+///
+/// ARGON: the obvious left-deep fold — `acc = acc.and(p)` in a loop — builds a
+/// tree whose depth is the NUMBER OF PREDICATES. Every traversal of a
+/// `Predicate` is recursive: [`Bind::bind`], `rewrite_not`, the `Display` impl,
+/// and the drop glue the compiler generates for the nested `Box`es. A caller
+/// that combines a few thousand predicates therefore overflows the thread's
+/// stack instead of returning an error — a 2 MiB tokio worker stack dies at
+/// roughly 1,350 levels of `bind`. Balancing bounds the depth at
+/// `ceil(log2(n))`, which bounds ALL of those traversals at once, and is why
+/// this is the structural fix rather than making one traversal iterative.
+///
+/// `AND` is associative and [`Predicate::and`]'s `AlwaysTrue` / `AlwaysFalse`
+/// simplifications are sound under any association, so the result is
+/// semantically identical to the fold it replaces.
+///
+/// An empty input yields [`Predicate::AlwaysTrue`], the identity for `AND`.
+pub(crate) fn and_all(predicates: Vec<Predicate>) -> Predicate {
+    let mut level = predicates;
+    if level.is_empty() {
+        return Predicate::AlwaysTrue;
+    }
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        let mut iter = level.into_iter();
+        while let Some(p1) = iter.next() {
+            match iter.next() {
+                Some(p2) => next.push(p1.and(p2)),
+                None => next.push(p1),
+            }
+        }
+        level = next;
+    }
+    level.pop().unwrap_or(Predicate::AlwaysTrue)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{Predicate, and_all};
+
+    /// ARGON (2026-08-28 demo-tail stack overflow). Depth measured ITERATIVELY
+    /// so the measurement itself cannot overflow the stack it is checking.
+    fn predicate_depth(root: &Predicate) -> usize {
+        let mut max = 0usize;
+        let mut stack = vec![(root, 1usize)];
+        while let Some((node, d)) = stack.pop() {
+            max = max.max(d);
+            match node {
+                Predicate::And(e) | Predicate::Or(e) => {
+                    for c in e.inputs() {
+                        stack.push((c, d + 1));
+                    }
+                }
+                Predicate::Not(e) => {
+                    for c in e.inputs() {
+                        stack.push((c, d + 1));
+                    }
+                }
+                _ => {}
+            }
+        }
+        max
+    }
+
+    /// The incident profile: the demo tail died binding a predicate combined
+    /// from ~1,383 equality-delete files. `and_all` must keep that logarithmic.
+    #[test]
+    fn and_all_is_balanced_at_incident_scale() {
+        const N: usize = 1500;
+        let mk = || -> Vec<Predicate> {
+            (0..N)
+                .map(|i| Reference::new("id").equal_to(Datum::long(i as i64)))
+                .collect()
+        };
+
+        let balanced = and_all(mk());
+        let depth = predicate_depth(&balanced);
+        // ceil(log2(1500)) == 11; +1 for the leaf level.
+        assert!(
+            depth <= 12,
+            "and_all must be balanced: depth {depth} for {N} predicates"
+        );
+
+        // CONTROL: the left-deep fold this replaced is linear in N. This proves
+        // the measurer actually detects the shape that overflowed, rather than
+        // reporting a small number for everything.
+        let linear = mk()
+            .into_iter()
+            .fold(Predicate::AlwaysTrue, |acc, p| acc.and(p));
+        assert_eq!(
+            predicate_depth(&linear),
+            N,
+            "the fold under test must be the linear shape"
+        );
+
+        // The balanced tree still binds, and binding is the traversal that
+        // overflowed in the incident.
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        balanced
+            .bind(schema, false)
+            .expect("balanced predicate binds at incident scale");
+    }
+
+    #[test]
+    fn and_all_edge_cases() {
+        assert_eq!(and_all(vec![]), Predicate::AlwaysTrue);
+
+        let one = Reference::new("id").equal_to(Datum::long(1));
+        assert_eq!(and_all(vec![one.clone()]), one);
+
+        // AlwaysFalse still short-circuits through the balanced reduction.
+        assert_eq!(
+            and_all(vec![one.clone(), Predicate::AlwaysFalse]),
+            Predicate::AlwaysFalse
+        );
+        // AlwaysTrue is the identity and is folded away, not left as a node.
+        assert_eq!(and_all(vec![one.clone(), Predicate::AlwaysTrue]), one);
+
+        // An odd count carries the unpaired tail forward correctly.
+        let three: Vec<Predicate> = (0..3)
+            .map(|i| Reference::new("id").equal_to(Datum::long(i)))
+            .collect();
+        assert_eq!(predicate_depth(&and_all(three)), 3);
+    }
     use std::ops::Not;
     use std::sync::Arc;
 

@@ -23,7 +23,7 @@ use tokio::sync::oneshot::Receiver;
 
 use crate::delete_vector::DeleteVector;
 use crate::expr::Predicate::AlwaysTrue;
-use crate::expr::{Bind, BoundPredicate, Predicate};
+use crate::expr::{Bind, BoundPredicate, Predicate, and_all};
 use crate::runtime::Runtime;
 use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
 use crate::spec::DataContentType;
@@ -191,7 +191,15 @@ impl DeleteFilter {
         // * Logical-AND them all together to get a single combined `Predicate`
         // * Bind the predicate to the task's schema to get a `BoundPredicate`
 
-        let mut combined_predicate = AlwaysTrue;
+        // ARGON: collected into a Vec and combined by `and_all` as a BALANCED
+        // tree. The left-deep fold this replaces made the predicate's depth
+        // equal to the number of equality-delete files on the data file, and
+        // the `bind` below recurses once per level — the 2026-08-28 demo-tail
+        // stack overflow was ~1,383 levels of `Predicate::bind` on a 2 MiB
+        // tokio worker stack. The sibling per-ROW combine in
+        // `caching_delete_file_loader` had already been balanced for exactly
+        // this reason; this per-FILE half had been left linear.
+        let mut predicates = Vec::with_capacity(file_scan_task.deletes.len());
         for delete in &file_scan_task.deletes {
             if !is_equality_delete(delete) {
                 continue;
@@ -210,8 +218,10 @@ impl DeleteFilter {
                 ));
             };
 
-            combined_predicate = combined_predicate.and(predicate);
+            predicates.push(predicate);
         }
+
+        let combined_predicate = and_all(predicates);
 
         if combined_predicate == AlwaysTrue {
             return Ok(None);
@@ -528,6 +538,70 @@ pub(crate) mod tests {
         assert!(
             result.is_err(),
             "case_sensitive=true should fail when column case mismatches"
+        );
+    }
+    /// ARGON incident profile (2026-08-28 demo-tail crash). The tail aborted
+    /// with `fatal runtime error: stack overflow` binding the predicate THIS
+    /// function builds: ~1,383 equality-delete files on a single data file,
+    /// combined left-deep, and `Predicate::bind` recurses once per level
+    /// (~1.5 KiB of frame) against a 2 MiB tokio worker stack.
+    ///
+    /// Against the linear fold this test does not "fail" — it ABORTS THE TEST
+    /// PROCESS, which is precisely why the defect reached production as a
+    /// crash rather than an error. With the balanced combine it returns.
+    #[tokio::test]
+    async fn test_build_equality_delete_predicate_at_incident_scale() {
+        const N: usize = 1500;
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let deletes: Vec<FileScanTaskDeleteFile> = (0..N)
+            .map(|i| {
+                FileScanTaskDeleteFile::builder()
+                    .with_file_path(format!("eq-del-{i}.parquet"))
+                    .with_file_size_in_bytes(1)
+                    .with_file_type(DataContentType::EqualityDeletes)
+                    .with_partition_spec_id(0)
+                    .build()
+            })
+            .collect();
+
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(0)
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path("data.parquet".to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema.clone())
+            .with_project_field_ids(vec![])
+            .with_deletes(deletes)
+            .with_case_sensitive(false)
+            .build();
+
+        let filter = DeleteFilter::new(Runtime::current());
+        for i in 0..N {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            filter.insert_equality_delete(&format!("eq-del-{i}.parquet"), rx);
+            tx.send(Reference::new("id").equal_to(Datum::long(i as i64)))
+                .unwrap();
+        }
+
+        let bound = filter
+            .build_equality_delete_predicate(&task)
+            .await
+            .expect("bind must not overflow the stack at incident scale");
+
+        assert!(
+            bound.is_some(),
+            "{N} equality-delete files must produce a bound predicate"
         );
     }
 }

@@ -29,7 +29,7 @@ use crate::arrow::scan_metrics::ScanMetrics;
 use crate::arrow::{arrow_primitive_to_literal, arrow_schema_to_schema};
 use crate::delete_vector::DeleteVector;
 use crate::expr::Predicate::AlwaysTrue;
-use crate::expr::{Predicate, Reference};
+use crate::expr::{Predicate, Reference, and_all};
 use crate::io::FileIO;
 use crate::runtime::Runtime;
 use crate::scan::{ArrowRecordBatchStream, FileScanTaskDeleteFile};
@@ -431,23 +431,12 @@ impl CachingDeleteFileLoader {
 
         // All row predicates are combined to a single predicate by creating a balanced binary tree.
         // Using a simple fold would result in a deeply nested predicate that can cause a stack overflow.
-        while row_predicates.len() > 1 {
-            let mut next_level = Vec::with_capacity(row_predicates.len().div_ceil(2));
-            let mut iter = row_predicates.into_iter();
-            while let Some(p1) = iter.next() {
-                if let Some(p2) = iter.next() {
-                    next_level.push(p1.and(p2));
-                } else {
-                    next_level.push(p1);
-                }
-            }
-            row_predicates = next_level;
-        }
-
-        match row_predicates.pop() {
-            Some(p) => Ok(p),
-            None => Ok(AlwaysTrue),
-        }
+        //
+        // ARGON: this was an inline copy of the balanced reduction. It now calls
+        // the shared `and_all`, so this rule has ONE implementation — the
+        // per-FILE combine in `delete_filter` was the second copy that never
+        // got the fix, and it is what overflowed the demo tail on 2026-08-28.
+        Ok(and_all(row_predicates))
     }
 }
 
