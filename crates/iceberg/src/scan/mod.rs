@@ -61,7 +61,38 @@ pub struct TableScanBuilder<'a> {
     concurrency_limit_manifest_files: usize,
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    split_size: Option<u64>,
 }
+
+/// ARGON: default byte span of one `FileScanTask` when a data file is split.
+///
+/// WHY THIS EXISTS AT ALL. The reader parallelises across `FileScanTask`s and
+/// nothing else, and until now the planner emitted exactly one task per data
+/// file. Parquet then walks that file's row groups SEQUENTIALLY, so a table
+/// with fewer data files than `concurrency_limit_data_files` reads with
+/// exactly `file_count` requests in flight, whatever the limit says. Measured
+/// (argon lane `query-scan-effective-concurrency`, 2026-08-28): with the same
+/// ~100 MB and the same per-request latency, peak wire concurrency was 58 at
+/// 64 files, **4 at 4 files and 1 at 1 file** — peak equals the file count,
+/// exactly. A compacted table is few-files by design, so compaction was
+/// silently capping read concurrency.
+///
+/// WHY 8 MiB rather than Iceberg's traditional 128 MiB. That figure is tuned
+/// for a cluster where task count is bounded by executors and each task should
+/// amortise its own scheduling. Here the bound being relieved is the number of
+/// requests ONE reader can keep in flight, so the split has to be small enough
+/// that a mid-sized file yields several tasks. 8 MiB turns a 13.6 MB file into
+/// 2 and a 72 MB file into 9.
+///
+/// WHAT IT COSTS. Each split re-reads the file's footer, so an N-way split adds
+/// N-1 metadata reads for that file. That is the trade: metadata round trips
+/// bought with parallelism on the data.
+///
+/// The read half needed no change — it already honours `task.start`/
+/// `task.length` (`arrow/reader/pipeline.rs`, byte-range row-group filtering)
+/// and already builds positional-delete row selections against the SELECTED
+/// row groups, so splits and deletes compose. Only the planner never split.
+pub const DEFAULT_SPLIT_SIZE: u64 = 8 * 1024 * 1024;
 
 impl<'a> TableScanBuilder<'a> {
     pub(crate) fn new(table: &'a Table) -> Self {
@@ -79,6 +110,7 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: num_cpus,
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
+            split_size: Some(DEFAULT_SPLIT_SIZE),
         }
     }
 
@@ -147,6 +179,14 @@ impl<'a> TableScanBuilder<'a> {
         self
     }
 
+    /// ARGON: byte span of one `FileScanTask`, i.e. how finely a data file is
+    /// split across tasks. `None` restores the pre-split behaviour of exactly
+    /// one task per data file. See [`DEFAULT_SPLIT_SIZE`].
+    pub fn with_split_size(mut self, split_size: Option<u64>) -> Self {
+        self.split_size = split_size;
+        self
+    }
+
     /// Sets the manifest entry concurrency limit for this scan
     pub fn with_manifest_entry_concurrency_limit(mut self, limit: usize) -> Self {
         self.concurrency_limit_manifest_entries = limit;
@@ -211,6 +251,7 @@ impl<'a> TableScanBuilder<'a> {
                         concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
                         row_group_filtering_enabled: self.row_group_filtering_enabled,
                         row_selection_enabled: self.row_selection_enabled,
+                        split_size: self.split_size,
                         runtime: self.table.runtime().clone(),
                     });
                 };
@@ -325,6 +366,7 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
+            split_size: self.split_size,
             runtime: self.table.runtime().clone(),
         })
     }
@@ -354,8 +396,63 @@ pub struct TableScan {
 
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    /// ARGON: see [`DEFAULT_SPLIT_SIZE`].
+    split_size: Option<u64>,
 
     runtime: Runtime,
+}
+
+/// ARGON: cut one whole-file [`FileScanTask`] into byte-range splits.
+///
+/// Contract, and every clause is load-bearing:
+///
+/// * **The splits TILE the file exactly** — contiguous, non-overlapping, and
+///   together covering `[start, start + length)` of the input. The reader
+///   assigns a row group to the split whose byte range contains the row
+///   group's MIDPOINT, half-open at the top
+///   (`arrow/reader/row_filter.rs:195-206`), so a tiling guarantees each row
+///   group is claimed exactly once — no duplicated rows, none dropped. That
+///   property is what makes this safe to do without reading the footer.
+/// * **`record_count` is dropped on a split.** Its own docs say it is only
+///   meaningful when the whole data file is being read, and a split reads
+///   part of one.
+/// * **One split means the task is returned UNCHANGED**, so a file at or
+///   under the split size, and every caller passing `None`, keeps byte-identical
+///   behaviour.
+/// * **A zero or absent split size disables splitting**, rather than dividing
+///   by zero.
+///
+/// Deletes need no special handling: positional-delete row selections are
+/// built against the SELECTED row groups
+/// (`arrow/reader/pipeline.rs`, `build_deletes_row_selection`), so a split
+/// task selects its own rows correctly.
+pub(crate) fn split_file_scan_task(task: FileScanTask, split_size: Option<u64>) -> Vec<FileScanTask> {
+    let Some(split_size) = split_size.filter(|s| *s > 0) else {
+        return vec![task];
+    };
+    if task.length <= split_size {
+        return vec![task];
+    }
+    // ceil-divide, so the last split absorbs the remainder rather than a
+    // sliver task being emitted for it.
+    let n = task.length.div_ceil(split_size);
+    let mut out = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let start = task.start + i * split_size;
+        // The last split runs to the exact end of the input range: tiling is
+        // the correctness property, so it may not be left short by rounding.
+        let end = if i + 1 == n {
+            task.start + task.length
+        } else {
+            start + split_size
+        };
+        let mut split = task.clone();
+        split.start = start;
+        split.length = end - start;
+        split.record_count = None;
+        out.push(split);
+    }
+    out
 }
 
 impl TableScan {
@@ -367,6 +464,7 @@ impl TableScan {
 
         let concurrency_limit_manifest_files = self.concurrency_limit_manifest_files;
         let concurrency_limit_manifest_entries = self.concurrency_limit_manifest_entries;
+        let split_size = self.split_size;
 
         // used to stream ManifestEntryContexts between stages of the file plan operation
         let (manifest_entry_data_ctx_tx, manifest_entry_data_ctx_rx) =
@@ -462,6 +560,7 @@ impl TableScan {
                                         Self::process_data_manifest_entry(
                                             manifest_entry_context,
                                             tx,
+                                            split_size,
                                         )
                                         .await
                                     })
@@ -511,6 +610,7 @@ impl TableScan {
     async fn process_data_manifest_entry(
         manifest_entry_context: ManifestEntryContext,
         mut file_scan_task_tx: Sender<Result<FileScanTask>>,
+        split_size: Option<u64>,
     ) -> Result<()> {
         // skip processing this manifest entry if it has been marked as deleted
         if !manifest_entry_context.manifest_entry.is_alive() {
@@ -558,9 +658,15 @@ impl TableScan {
         // congratulations! the manifest entry has made its way through the
         // entire plan without getting filtered out. Create a corresponding
         // FileScanTask and push it to the result stream
-        file_scan_task_tx
-            .send(Ok(manifest_entry_context.into_file_scan_task().await?))
-            .await?;
+        // ARGON: one data file may become SEVERAL tasks. The reader
+        // parallelises across tasks and reads a single file's row groups
+        // sequentially, so without this a table with fewer data files than
+        // `concurrency_limit_data_files` can never reach that limit. See
+        // [`DEFAULT_SPLIT_SIZE`] for the measurement that motivated it.
+        let task = manifest_entry_context.into_file_scan_task().await?;
+        for split in split_file_scan_task(task, split_size) {
+            file_scan_task_tx.send(Ok(split)).await?;
+        }
 
         Ok(())
     }
@@ -616,8 +722,119 @@ pub(crate) struct BoundPredicates {
 
 #[cfg(test)]
 pub mod tests {
+
     //! shared tests for the table scan API
     #![allow(missing_docs)]
+
+    // ---- ARGON: file splitting (lane `query-scan-effective-concurrency`) ---
+    //
+    // The property under test is TILING: the splits must be contiguous,
+    // non-overlapping, and exactly cover the input range. The reader claims a
+    // row group by MIDPOINT with a half-open upper bound, so a gap silently
+    // DROPS rows and an overlap silently DUPLICATES them — neither fails
+    // loudly anywhere else. A boundary matrix is included, because the
+    // boundary is where a tiling breaks.
+
+    fn split_fixture(start: u64, length: u64) -> FileScanTask {
+        FileScanTask::builder()
+            .with_file_size_in_bytes(start + length)
+            .with_start(start)
+            .with_length(length)
+            .with_record_count(Some(1234))
+            .with_data_file_path("s3://b/f.parquet".to_string())
+            .with_data_file_format(crate::spec::DataFileFormat::Parquet)
+            .with_schema(std::sync::Arc::new(
+                crate::spec::Schema::builder()
+                    .with_schema_id(0)
+                    .build()
+                    .unwrap(),
+            ))
+            .with_project_field_ids(vec![])
+            .with_case_sensitive(true)
+            .build()
+    }
+
+    fn assert_tiles(start: u64, length: u64, split: u64) -> Vec<FileScanTask> {
+        let out = super::split_file_scan_task(split_fixture(start, length), Some(split));
+        assert!(!out.is_empty(), "splitting never yields zero tasks");
+        assert_eq!(out[0].start, start, "first split starts where the file does");
+        let mut cursor = start;
+        for t in &out {
+            assert_eq!(
+                t.start, cursor,
+                "splits must be contiguous — a gap drops row groups"
+            );
+            assert!(t.length > 0, "a zero-length split can never claim a midpoint");
+            cursor += t.length;
+        }
+        assert_eq!(cursor, start + length, "splits must cover the whole range");
+        out
+    }
+
+    #[test]
+    fn splits_tile_the_file_exactly_across_a_boundary_matrix() {
+        for (len, split) in [
+            (100u64, 10u64),
+            (99, 10),
+            (101, 10),
+            (8 * 1024 * 1024 + 1, 8 * 1024 * 1024),
+            (73_688_338, 8 * 1024 * 1024),
+            (7, 3),
+        ] {
+            let out = assert_tiles(0, len, split);
+            assert_eq!(
+                out.len() as u64,
+                len.div_ceil(split),
+                "split count for len={len} split={split}"
+            );
+        }
+        assert_tiles(4096, 100, 10);
+    }
+
+    #[test]
+    fn a_file_at_or_under_the_split_size_is_returned_unchanged() {
+        for len in [1u64, 9, 10] {
+            let out = super::split_file_scan_task(split_fixture(0, len), Some(10));
+            assert_eq!(out.len(), 1, "len={len} must not be split");
+            assert_eq!(out[0].length, len);
+            assert_eq!(
+                out[0].record_count,
+                Some(1234),
+                "an unsplit task keeps record_count — it really does read the whole file"
+            );
+        }
+    }
+
+    #[test]
+    fn splitting_is_off_when_no_split_size_is_given() {
+        for sz in [None, Some(0u64)] {
+            let out = super::split_file_scan_task(split_fixture(0, 1_000_000), sz);
+            assert_eq!(out.len(), 1, "split_size={sz:?} must leave the task alone");
+            assert_eq!(out[0].record_count, Some(1234));
+        }
+    }
+
+    #[test]
+    fn a_split_drops_record_count_because_it_no_longer_reads_the_whole_file() {
+        let out = super::split_file_scan_task(split_fixture(0, 100), Some(10));
+        assert_eq!(out.len(), 10);
+        assert!(
+            out.iter().all(|t| t.record_count.is_none()),
+            "record_count is whole-file-only; a split that kept it would lie"
+        );
+    }
+
+    #[test]
+    fn a_split_carries_the_identity_of_its_parent() {
+        let parent = split_fixture(0, 100);
+        let out = super::split_file_scan_task(parent.clone(), Some(10));
+        for t in &out {
+            assert_eq!(t.data_file_path, parent.data_file_path);
+            assert_eq!(t.project_field_ids, parent.project_field_ids);
+            assert_eq!(t.deletes.len(), parent.deletes.len());
+            assert_eq!(t.file_size_in_bytes, parent.file_size_in_bytes);
+        }
+    }
 
     use std::collections::HashMap;
     use std::fs;
